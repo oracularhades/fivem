@@ -871,6 +871,57 @@ DLL_EXPORT ID3D11Device* GetRawD3D11Device()
 	return g_origDevice;
 }
 
+// Creates a D3D11_RESOURCE_MISC_SHARED BGRA render-target texture on the game's
+// device and returns both the texture and its legacy DXGI shared handle.
+// Bypasses CreateTexture2DHook / Texture2DWrap so that IDXGIResource is directly
+// accessible.  Used by ServoSharedTextureBridge.
+DLL_EXPORT HRESULT CreateSharedNUITexture(int width, int height,
+                                           ID3D11Texture2D** ppTexture,
+                                           HANDLE*           pSharedHandle)
+{
+	if (!g_origCreateTexture2D || !g_origDevice)
+	{
+		return E_FAIL;
+	}
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width            = static_cast<UINT>(width);
+	desc.Height           = static_cast<UINT>(height);
+	desc.MipLevels        = 1;
+	desc.ArraySize        = 1;
+	desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage            = D3D11_USAGE_DEFAULT;
+	desc.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	desc.MiscFlags        = D3D11_RESOURCE_MISC_SHARED;
+
+	WRL::ComPtr<ID3D11Texture2D> tex;
+	// Call g_origCreateTexture2D directly to get an unwrapped ID3D11Texture2D.
+	HRESULT hr = g_origCreateTexture2D(g_origDevice, &desc, nullptr, &tex);
+	if (FAILED(hr))
+	{
+		return hr;
+	}
+
+	WRL::ComPtr<IDXGIResource> dxgiRes;
+	hr = tex.As(&dxgiRes);
+	if (FAILED(hr))
+	{
+		return hr;
+	}
+
+	HANDLE handle = NULL;
+	hr = dxgiRes->GetSharedHandle(&handle);
+	if (FAILED(hr) || !handle)
+	{
+		return FAILED(hr) ? hr : E_FAIL;
+	}
+
+	tex.CopyTo(ppTexture);
+	*pSharedHandle = handle;
+	return S_OK;
+}
+
 static void PatchAdapter(IDXGIAdapter** pAdapter)
 {
 	if (!*pAdapter)
@@ -1350,6 +1401,13 @@ namespace nui
 std::string GetContext();
 }
 
+// When true the root NUI window uses Servo/WebRender instead of CEF.
+// The Servo subprocess reads the shared slot "CfxServoRender_root" to find
+// the D3D11 shared texture handle and create an ANGLE EGL surface from it.
+// g_nuiUseServoMode is readable from NUIWindow.cpp (same DLL) via extern.
+bool g_nuiUseServoMode = false;
+static ConVar<bool> nuiUseServo("nui_useServo", ConVar_None, false, &g_nuiUseServoMode);
+
 void CreateRootWindow()
 {
 	int resX, resY;
@@ -1587,28 +1645,66 @@ void Initialize(nui::GameInterface* gi)
 		nui::OnInitialize();
 	});
 	
-	static ConsoleCommand devtoolsCmd("nui_devtools", []()
+	// Port on which the Servo/Firefox remote debugger listens.
+	// Open about:debugging in Firefox and connect to localhost:<port>,
+	// or navigate directly to http://localhost:<port> for the JSON index.
+	static ConVar<int> servoDevPort("nui_servoDevToolsPort", ConVar_None, 6080);
+
+	// Helper: open the Servo remote-debugging UI in the system default browser.
+	auto openServoDevTools = [&servoDevPort](const std::string& label)
+	{
+		auto url = fmt::sprintf("http://localhost:%d", servoDevPort.GetValue());
+		trace("[Servo] Opening devtools for '%s' at %s\n", label.c_str(), url.c_str());
+		ShellExecuteW(NULL, L"open", ToWide(url).c_str(), NULL, NULL, SW_SHOWNORMAL);
+	};
+
+	static ConsoleCommand devtoolsCmd("nui_devtools", [openServoDevTools]()
 	{
 		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
 
-		if (rootWindow.GetRef())
+		if (!rootWindow.GetRef())
 		{
-			auto browser = rootWindow->GetBrowser();
+			return;
+		}
 
-			if (browser)
-			{
-				CefWindowInfo wi;
-				wi.SetAsPopup(NULL, "NUI DevTools");
+		// Servo path: open the Firefox/Servo remote debugger in the system browser.
+		if (rootWindow->HasServoBridge())
+		{
+			openServoDevTools("root");
+			return;
+		}
 
-				CefBrowserSettings s;
+		// CEF path: pop up the built-in Chromium DevTools window.
+		auto browser = rootWindow->GetBrowser();
 
-				browser->GetHost()->ShowDevTools(wi, new NUIClient(nullptr), s, {});
-			}
+		if (browser)
+		{
+			CefWindowInfo wi;
+			wi.SetAsPopup(NULL, "NUI DevTools");
+
+			CefBrowserSettings s;
+
+			browser->GetHost()->ShowDevTools(wi, new NUIClient(nullptr), s, {});
 		}
 	});
 
-	static ConsoleCommand devtoolsWindowCmd("nui_devtools", [](const std::string& windowName)
+	static ConsoleCommand devtoolsWindowCmd("nui_devtools", [openServoDevTools](const std::string& windowName)
 	{
+		// Resolve window by name (with and without the "nui_" prefix).
+		auto nuiWindow = nui::FindNUIWindow(windowName);
+		if (!nuiWindow.GetRef())
+		{
+			nuiWindow = nui::FindNUIWindow(fmt::sprintf("nui_%s", windowName));
+		}
+
+		// Servo path: open the remote debugger for the named window.
+		if (nuiWindow.GetRef() && nuiWindow->HasServoBridge())
+		{
+			openServoDevTools(windowName);
+			return;
+		}
+
+		// CEF path: fall back to the browser-based devtools window.
 		auto browser = nui::GetNUIWindowBrowser(windowName);
 
 		if (!browser)
@@ -1639,6 +1735,17 @@ void Initialize(nui::GameInterface* gi)
 		Instance<NUIWindowManager>::Get()->ForAllWindows([](auto window)
 		{
 			window->InitializeRenderBacking();
+
+			// If the Servo convar is set, replace the CEF render path with
+			// an ANGLE shared texture bridge for this window.
+			if (g_nuiUseServoMode && window->IsPrimary())
+			{
+				// Slot name matches what ServoEGL_Create() uses on the
+				// Servo subprocess side.
+				window->InitializeServoBacking(
+					fmt::sprintf("CfxServoRender_%s",
+						window->GetName().empty() ? "root" : window->GetName()));
+			}
 		});
 	});
 

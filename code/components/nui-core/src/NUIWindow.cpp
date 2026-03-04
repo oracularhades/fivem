@@ -25,6 +25,9 @@
 
 extern nui::GameInterface* g_nuiGi;
 
+// Set by NUIInitialize.cpp when nui_useServo convar is true.
+extern bool g_nuiUseServoMode;
+
 #include "memdbgon.h"
 
 extern std::wstring GetNUIStoragePath();
@@ -102,6 +105,12 @@ fwRefContainer<NUIWindow> NUIWindow::Create(bool primary, int width, int height,
 
 void NUIWindow::DeferredCreate()
 {
+	// In Servo mode, primary windows have no CEF browser; skip CEF init.
+	if (m_rawBlit && g_nuiUseServoMode)
+	{
+		return;
+	}
+
 	if (!m_client)
 	{
 		Initialize(m_initUrl);
@@ -342,6 +351,15 @@ void NUIWindow::Initialize(CefString url)
 
 	InitializeRenderBacking();
 
+	// In Servo mode the primary window is driven by WebRender, not CEF.
+	// Skip browser creation entirely; InitializeServoBacking() (called from
+	// OnInitRenderer) will set up the ANGLE shared texture bridge instead.
+	// m_client remains null — all code that uses it already guards with null checks.
+	if (m_rawBlit && g_nuiUseServoMode)
+	{
+		return;
+	}
+
 	// create the client/browser instance
 	{
 		CefRefPtr<NUIClient> client = new NUIClient(this);
@@ -420,6 +438,55 @@ void NUIWindow::InitializeRenderBacking()
 		}
 	}
 
+}
+
+void NUIWindow::InitializeServoBacking(const std::string& slotName)
+{
+#ifdef GTA_FIVE
+	if (!nui::g_rendererInit)
+	{
+		return;
+	}
+
+	// Retrieve the raw ID3D11Device from the game interface.
+	// The game-interface wrapper stores the raw device at vtbl+8 by convention
+	// (see GtaNui.cpp / GtaNuiInterface::GetD3D11Device).
+	extern ID3D11Device* GetRawD3D11Device();
+	ID3D11Device* device = GetRawD3D11Device();
+	if (!device)
+	{
+		trace("[Servo] InitializeServoBacking: no D3D11 device yet\n");
+		return;
+	}
+
+	// Build a shared-memory slot name scoped to this window's name so
+	// multiple NUI windows don't collide.
+	std::string fullSlotName = slotName.empty()
+		? fmt::sprintf("CfxServoRender_%s", m_name.empty() ? "default" : m_name)
+		: slotName;
+
+	auto bridge = nui::ServoSharedTextureBridge::Create(device, fullSlotName, m_width, m_height);
+	if (!bridge)
+	{
+		trace("[Servo] InitializeServoBacking: failed to create bridge for '%s'\n", fullSlotName.c_str());
+		return;
+	}
+
+	m_servoBridge.reset(bridge);
+
+	// Wrap the bridge's D3D11 texture in a GITexture so the existing
+	// NUI composite path (SetTexture / DrawRectangles) can use it without
+	// modification.  We use CreateTextureFromShareHandle() because it does
+	// exactly what we need: device->OpenSharedResource → rage::grcTexture.
+	{
+		std::lock_guard<std::shared_mutex> _(m_textureMutex);
+		m_nuiTexture = g_nuiGi->CreateTextureFromShareHandle(
+			m_servoBridge->GetSharedHandle(), m_width, m_height);
+	}
+
+	trace("[Servo] InitializeServoBacking: bridge ready for '%s' (%dx%d), handle=%p\n",
+		fullSlotName.c_str(), m_width, m_height, m_servoBridge->GetSharedHandle());
+#endif
 }
 
 void NUIWindow::AddDirtyRect(const CefRect& rect)
@@ -589,6 +656,17 @@ void NUIWindow::UpdateFrame()
 				}
 			}
 
+			// Resize the Servo shared texture and re-wrap it for compositing.
+			if (m_servoBridge)
+			{
+				if (m_servoBridge->Resize(resX, resY))
+				{
+					std::lock_guard<std::shared_mutex> _(m_textureMutex);
+					m_nuiTexture = g_nuiGi->CreateTextureFromShareHandle(
+						m_servoBridge->GetSharedHandle(), resX, resY);
+				}
+			}
+
 			if (m_client)
 			{
 				if (!m_nuiTexture.GetRef())
@@ -630,6 +708,25 @@ void NUIWindow::UpdateFrame()
 	}
 
 	m_pollQueue.clear();
+
+	// ── Servo rendering path ──────────────────────────────────────────────────
+	// When a Servo bridge is active, m_nuiTexture already wraps the shared
+	// D3D11 texture that Servo renders into via ANGLE.  There is no CEF
+	// callback, no Y-flip (WebRender renders top-down like D3D), and no copy:
+	// the game composites m_nuiTexture directly.  We just need to notice when
+	// Servo has finished a new frame and trigger a composite pass.
+	if (m_servoBridge)
+	{
+		if (m_servoBridge->HasNewFrame())
+		{
+			m_servoBridge->ConsumeFrame();
+			MarkRenderBufferDirty();
+		}
+		// Skip the CEF shared-resource copy / flip path entirely.
+		// The NUIRenderCallbacks composite pass will read m_nuiTexture directly.
+		return;
+	}
+	// ─────────────────────────────────────────────────────────────────────────
 
 	NUIWindowManager* wm = Instance<NUIWindowManager>::Get();
 	auto texture = GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW);
@@ -957,6 +1054,10 @@ void NUIWindow::SetPaintType(NUIPaintType type)
 
 void NUIWindow::Invalidate()
 {
+	if (!m_client)
+	{
+		return;
+	}
 	((NUIClient*)m_client.get())->GetBrowser()->GetHost()->Invalidate(PET_VIEW);
 }
 

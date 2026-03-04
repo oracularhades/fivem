@@ -17,6 +17,8 @@
 
 #include <wrl.h>
 
+#include "ServoSharedTexture.h"
+
 enum NUIPaintType
 {
 	NUIPaintTypeDummy,
@@ -85,6 +87,12 @@ private:
 
 	bool m_dereferencedNuiTexture;
 
+	// Servo ANGLE shared texture bridge.
+	// Non-null when this window is using Servo instead of CEF for rendering.
+	// The bridge owns a D3D11_RESOURCE_MISC_SHARED texture that Servo renders
+	// into via ANGLE; the game reads from it directly in UpdateServoFrame().
+	std::unique_ptr<nui::ServoSharedTextureBridge> m_servoBridge;
+
 	CefRect m_popupRect;
 
 	std::shared_mutex m_textureMutex;
@@ -104,6 +112,15 @@ public:
 	void TouchMessage();
 
 	void InitializeRenderBacking();
+
+	// Creates the Servo ANGLE shared texture bridge for this window.
+	// Called from InitializeRenderBacking() when SERVO_INTEGRATION is active.
+	// `slotName` must match the name passed to ServoEGL_Create() on the
+	// Servo subprocess side (e.g. "CfxServoRender_root").
+	void InitializeServoBacking(const std::string& slotName);
+
+	// Returns true if this window is using Servo rendering.
+	bool HasServoBridge() const { return m_servoBridge != nullptr; }
 
 	inline const std::string& GetName()
 	{
