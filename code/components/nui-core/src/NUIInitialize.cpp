@@ -1394,7 +1394,7 @@ void Component_RunPreInit()
 	{
 		TerminateProcess(GetCurrentProcess(), exitCode);
 	}
-}
+}	
 
 namespace nui
 {
@@ -1405,7 +1405,7 @@ std::string GetContext();
 // The Servo subprocess reads the shared slot "CfxServoRender_root" to find
 // the D3D11 shared texture handle and create an ANGLE EGL surface from it.
 // g_nuiUseServoMode is readable from NUIWindow.cpp (same DLL) via extern.
-bool g_nuiUseServoMode = false;
+bool g_nuiUseServoMode = true;
 static ConVar<bool> nuiUseServo("nui_useServo", ConVar_None, false, &g_nuiUseServoMode);
 
 void CreateRootWindow()
@@ -1645,66 +1645,28 @@ void Initialize(nui::GameInterface* gi)
 		nui::OnInitialize();
 	});
 	
-	// Port on which the Servo/Firefox remote debugger listens.
-	// Open about:debugging in Firefox and connect to localhost:<port>,
-	// or navigate directly to http://localhost:<port> for the JSON index.
-	static ConVar<int> servoDevPort("nui_servoDevToolsPort", ConVar_None, 6080);
-
-	// Helper: open the Servo remote-debugging UI in the system default browser.
-	auto openServoDevTools = [&servoDevPort](const std::string& label)
-	{
-		auto url = fmt::sprintf("http://localhost:%d", servoDevPort.GetValue());
-		trace("[Servo] Opening devtools for '%s' at %s\n", label.c_str(), url.c_str());
-		ShellExecuteW(NULL, L"open", ToWide(url).c_str(), NULL, NULL, SW_SHOWNORMAL);
-	};
-
-	static ConsoleCommand devtoolsCmd("nui_devtools", [openServoDevTools]()
+	static ConsoleCommand devtoolsCmd("nui_devtools", []()
 	{
 		auto rootWindow = Instance<NUIWindowManager>::Get()->GetRootWindow();
 
-		if (!rootWindow.GetRef())
+		if (rootWindow.GetRef())
 		{
-			return;
-		}
+			auto browser = rootWindow->GetBrowser();
 
-		// Servo path: open the Firefox/Servo remote debugger in the system browser.
-		if (rootWindow->HasServoBridge())
-		{
-			openServoDevTools("root");
-			return;
-		}
+			if (browser)
+			{
+				CefWindowInfo wi;
+				wi.SetAsPopup(NULL, "NUI DevTools");
 
-		// CEF path: pop up the built-in Chromium DevTools window.
-		auto browser = rootWindow->GetBrowser();
+				CefBrowserSettings s;
 
-		if (browser)
-		{
-			CefWindowInfo wi;
-			wi.SetAsPopup(NULL, "NUI DevTools");
-
-			CefBrowserSettings s;
-
-			browser->GetHost()->ShowDevTools(wi, new NUIClient(nullptr), s, {});
+				browser->GetHost()->ShowDevTools(wi, new NUIClient(nullptr), s, {});
+			}
 		}
 	});
 
-	static ConsoleCommand devtoolsWindowCmd("nui_devtools", [openServoDevTools](const std::string& windowName)
+	static ConsoleCommand devtoolsWindowCmd("nui_devtools", [](const std::string& windowName)
 	{
-		// Resolve window by name (with and without the "nui_" prefix).
-		auto nuiWindow = nui::FindNUIWindow(windowName);
-		if (!nuiWindow.GetRef())
-		{
-			nuiWindow = nui::FindNUIWindow(fmt::sprintf("nui_%s", windowName));
-		}
-
-		// Servo path: open the remote debugger for the named window.
-		if (nuiWindow.GetRef() && nuiWindow->HasServoBridge())
-		{
-			openServoDevTools(windowName);
-			return;
-		}
-
-		// CEF path: fall back to the browser-based devtools window.
 		auto browser = nui::GetNUIWindowBrowser(windowName);
 
 		if (!browser)

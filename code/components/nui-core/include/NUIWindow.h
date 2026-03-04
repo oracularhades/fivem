@@ -88,10 +88,16 @@ private:
 	bool m_dereferencedNuiTexture;
 
 	// Servo ANGLE shared texture bridge.
-	// Non-null when this window is using Servo instead of CEF for rendering.
-	// The bridge owns a D3D11_RESOURCE_MISC_SHARED texture that Servo renders
-	// into via ANGLE; the game reads from it directly in UpdateServoFrame().
+	// Non-null when this window has a Servo bridge, regardless of whether a
+	// Servo renderer has connected yet.  CEF continues to drive m_nuiTexture
+	// until Servo produces its first frame, at which point m_servoTexture is
+	// swapped in.
 	std::unique_ptr<nui::ServoSharedTextureBridge> m_servoBridge;
+
+	// GITexture wrapping the Servo shared D3D11 texture.
+	// Kept separate from m_nuiTexture so CEF can still update m_nuiTexture
+	// (and show the game UI) until Servo actually starts rendering.
+	fwRefContainer<nui::GITexture> m_servoTexture;
 
 	CefRect m_popupRect;
 

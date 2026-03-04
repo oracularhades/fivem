@@ -25,9 +25,6 @@
 
 extern nui::GameInterface* g_nuiGi;
 
-// Set by NUIInitialize.cpp when nui_useServo convar is true.
-extern bool g_nuiUseServoMode;
-
 #include "memdbgon.h"
 
 extern std::wstring GetNUIStoragePath();
@@ -105,12 +102,6 @@ fwRefContainer<NUIWindow> NUIWindow::Create(bool primary, int width, int height,
 
 void NUIWindow::DeferredCreate()
 {
-	// In Servo mode, primary windows have no CEF browser; skip CEF init.
-	if (m_rawBlit && g_nuiUseServoMode)
-	{
-		return;
-	}
-
 	if (!m_client)
 	{
 		Initialize(m_initUrl);
@@ -351,15 +342,6 @@ void NUIWindow::Initialize(CefString url)
 
 	InitializeRenderBacking();
 
-	// In Servo mode the primary window is driven by WebRender, not CEF.
-	// Skip browser creation entirely; InitializeServoBacking() (called from
-	// OnInitRenderer) will set up the ANGLE shared texture bridge instead.
-	// m_client remains null — all code that uses it already guards with null checks.
-	if (m_rawBlit && g_nuiUseServoMode)
-	{
-		return;
-	}
-
 	// create the client/browser instance
 	{
 		CefRefPtr<NUIClient> client = new NUIClient(this);
@@ -474,18 +456,15 @@ void NUIWindow::InitializeServoBacking(const std::string& slotName)
 
 	m_servoBridge.reset(bridge);
 
-	// Wrap the bridge's D3D11 texture in a GITexture so the existing
-	// NUI composite path (SetTexture / DrawRectangles) can use it without
-	// modification.  We use CreateTextureFromShareHandle() because it does
-	// exactly what we need: device->OpenSharedResource → rage::grcTexture.
-	{
-		std::lock_guard<std::shared_mutex> _(m_textureMutex);
-		m_nuiTexture = g_nuiGi->CreateTextureFromShareHandle(
-			m_servoBridge->GetSharedHandle(), m_width, m_height);
-	}
+	// Wrap the bridge's D3D11 texture into m_servoTexture (NOT m_nuiTexture).
+	// CEF keeps driving m_nuiTexture so the game UI continues to show normally.
+	// UpdateFrame() swaps m_servoTexture → m_nuiTexture on the first Servo frame.
+	m_servoTexture = g_nuiGi->CreateTextureFromShareHandle(
+		m_servoBridge->GetSharedHandle(), m_width, m_height);
 
-	trace("[Servo] InitializeServoBacking: bridge ready for '%s' (%dx%d), handle=%p\n",
-		fullSlotName.c_str(), m_width, m_height, m_servoBridge->GetSharedHandle());
+	trace("[Servo] InitializeServoBacking: bridge ready for '%s' (%dx%d), handle=%p, servoTex=%s\n",
+		fullSlotName.c_str(), m_width, m_height, m_servoBridge->GetSharedHandle(),
+		m_servoTexture.GetRef() ? "ok" : "FAILED");
 #endif
 }
 
@@ -656,13 +635,13 @@ void NUIWindow::UpdateFrame()
 				}
 			}
 
-			// Resize the Servo shared texture and re-wrap it for compositing.
+			// Resize the Servo shared texture and re-wrap m_servoTexture.
+			// m_nuiTexture is NOT touched here; CEF continues to own it.
 			if (m_servoBridge)
 			{
 				if (m_servoBridge->Resize(resX, resY))
 				{
-					std::lock_guard<std::shared_mutex> _(m_textureMutex);
-					m_nuiTexture = g_nuiGi->CreateTextureFromShareHandle(
+					m_servoTexture = g_nuiGi->CreateTextureFromShareHandle(
 						m_servoBridge->GetSharedHandle(), resX, resY);
 				}
 			}
@@ -710,21 +689,25 @@ void NUIWindow::UpdateFrame()
 	m_pollQueue.clear();
 
 	// ── Servo rendering path ──────────────────────────────────────────────────
-	// When a Servo bridge is active, m_nuiTexture already wraps the shared
-	// D3D11 texture that Servo renders into via ANGLE.  There is no CEF
-	// callback, no Y-flip (WebRender renders top-down like D3D), and no copy:
-	// the game composites m_nuiTexture directly.  We just need to notice when
-	// Servo has finished a new frame and trigger a composite pass.
-	if (m_servoBridge)
+	// CEF continues to run normally (providing the game UI and JS bridge).
+	// When Servo produces a frame it is swapped into m_nuiTexture so the
+	// compositor shows Servo output instead of CEF output.  Until the first
+	// Servo frame arrives, the CEF texture shows as normal.
+	if (m_servoBridge && m_servoTexture.GetRef())
 	{
 		if (m_servoBridge->HasNewFrame())
 		{
 			m_servoBridge->ConsumeFrame();
+			// Swap Servo texture into the compositor slot.
+			{
+				std::lock_guard<std::shared_mutex> _(m_textureMutex);
+				m_nuiTexture = m_servoTexture;
+			}
 			MarkRenderBufferDirty();
 		}
-		// Skip the CEF shared-resource copy / flip path entirely.
-		// The NUIRenderCallbacks composite pass will read m_nuiTexture directly.
-		return;
+		// The rawBlit CEF path below is a no-op for primary windows anyway
+		// (no flip needed), so falling through is safe and keeps CEF resize
+		// handling working.
 	}
 	// ─────────────────────────────────────────────────────────────────────────
 
@@ -1054,10 +1037,6 @@ void NUIWindow::SetPaintType(NUIPaintType type)
 
 void NUIWindow::Invalidate()
 {
-	if (!m_client)
-	{
-		return;
-	}
 	((NUIClient*)m_client.get())->GetBrowser()->GetHost()->Invalidate(PET_VIEW);
 }
 
